@@ -8,23 +8,22 @@ from bs4 import BeautifulSoup
 from google import genai
 from pydantic import BaseModel, Field
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "")
 
 ARQUIVO_HISTORICO = "historico_vagas.json"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
-# 1. Adicionámos o campo 'inscricoes_abertas' e 'fim_inscricoes' na mesma chamada (sem peso extra!)
 class AnaliseEdital(BaseModel):
     inscricoes_abertas: bool = Field(
-        description="True APENAS se o edital já foi publicado e o prazo de inscrição ainda está aberto na data de hoje (ou abre nos próximos dias). False se for apenas previsto, autorizado, suspenso, gabarito ou se o prazo de inscrição já passou."
+        description="True APENAS se o edital está com inscrições abertas hoje (ou abre nos próximos dias). False se for previsto, suspenso, gabarito ou encerrado."
     )
     esfera_valida: bool = Field(
         description="True APENAS se for Prefeitura Municipal ou Secretaria Estadual (SEDUC/SED). False se for IF, UF, Universidade ou Militar."
@@ -47,8 +46,11 @@ class AnaliseEdital(BaseModel):
 
 def carregar_historico():
     if os.path.exists(ARQUIVO_HISTORICO):
-        with open(ARQUIVO_HISTORICO, "r", encoding="utf-8") as f:
-            return set(json.load(f))
+        try:
+            with open(ARQUIVO_HISTORICO, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
     return set()
 
 def salvar_historico(historico):
@@ -57,23 +59,26 @@ def salvar_historico(historico):
 
 def enviar_telegram(mensagem):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("ERRO: TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID não configurados nos Secrets!")
+        print("AVISO: TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID vazios nos Secrets!")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID.strip(),
+        "chat_id": TELEGRAM_CHAT_ID,
         "text": mensagem,
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
-    resp = requests.post(url, json=payload, timeout=15)
-    print(f"Status envio Telegram: {resp.status_code}")
+    try:
+        resp = requests.post(url, json=payload, timeout=15)
+        print(f"Status envio Telegram: {resp.status_code} - {resp.text[:120]}")
+    except Exception as e:
+        print(f"Erro ao conectar no Telegram: {e}")
 
 def extrair_vagas():
     vagas = []
     urls_vistas = set()
 
-    # FONTE 1: PCI Concursos (A página de cargos já lista maioritariamente concursos ativos)
+    # FONTE 1: PCI Concursos
     try:
         url_pci = "https://www.pciconcursos.com.br/cargos/professor-de-historia"
         resp = requests.get(url_pci, headers=HEADERS, timeout=20)
@@ -89,9 +94,9 @@ def extrair_vagas():
     except Exception as e:
         print(f"Aviso Fonte 1 (PCI): {e}")
 
-    # FONTE 2: Google News RSS focado em "inscrições abertas" e "edital publicado"
+    # FONTE 2: Google News RSS
     try:
-        query = urllib.parse.quote('("Professor de História" OR "Docente - História") ("inscrições abertas" OR "abre inscrições" OR "edital publicado" OR "PND") (prefeitura OR secretaria)')
+        query = urllib.parse.quote('("Professor de História" OR "Docente - História") (edital OR concurso OR inscrições OR PND) (prefeitura OR secretaria)')
         rss_url = f"https://news.google.com/rss/search?q={query}+when:7d&hl=pt-BR&gl=BR&ceid=BR:pt-419"
         resp_rss = requests.get(rss_url, headers=HEADERS, timeout=20)
         soup_rss = BeautifulSoup(resp_rss.text, "xml")
@@ -106,9 +111,6 @@ def extrair_vagas():
     except Exception as e:
         print(f"Aviso Fonte 2 (RSS): {e}")
 
-    # PRÉ-FILTRO ULTRALEVE (Zero custo de IA):
-    # 1. Remove IFs e Universidades
-    # 2. Remove notícias que NÃO são de editais abertos (previstos, gabaritos, resultados, suspensos)
     regex_instituicoes_excluidas = r"\b(IF[A-Z]+|UF[A-Z]+|UTFPR|CEFET|UNIVERSIDADE|FACULDADE)\b"
     regex_nao_abertos = r"\b(GABARITO|RESULTADO|CONVOCA[ÇC][ÃA]O|HOMOLOGA[ÇC][ÃA]O|SUSPENSO|CANCELADO|ADIADO|PREVISTO|COMISS[ÃA]O FORMADA|AUTORIZADO)\b"
 
@@ -118,12 +120,11 @@ def extrair_vagas():
         if re.search(regex_instituicoes_excluidas, titulo_upper):
             continue
         if re.search(regex_nao_abertos, titulo_upper):
-            print(f"Ignorado no pré-filtro (não é edital aberto): {v['titulo']}")
             continue
         vagas_filtradas.append(v)
 
-    print(f"Total de vagas abertas pré-selecionadas hoje: {len(vagas_filtradas)}")
-    return vagas_filtradas[:15]
+    print(f"Total de vagas abertas pre-selecionadas hoje: {len(vagas_filtradas)}")
+    return vagas_filtradas[:12]
 
 def analisar_vaga_com_ia(client, vaga, data_hoje):
     texto_limpo = vaga["resumo_extra"]
@@ -145,7 +146,7 @@ def analisar_vaga_com_ia(client, vaga, data_hoje):
     {texto_limpo}
 
     Regras estritas de aprovação:
-    1. INSCRIÇÕES ABERTAS: Verifique se o edital está com inscrições abertas (ou prestes a abrir) considerando a data de hoje ({data_hoje}). Se o prazo final de inscrição já passou, ou se for apenas um concurso previsto/comissão formada sem edital, marque inscricoes_abertas = False.
+    1. INSCRIÇÕES ABERTAS: Verifique se o edital está com inscrições abertas (ou prestes a abrir) considerando a data de hoje ({data_hoje}). Se o prazo final já passou, ou se for apenas previsto/comissão sem edital, marque inscricoes_abertas = False.
     2. Esfera: DEVE ser Prefeitura Municipal ou Secretaria Estadual. Rejeite IFs, UFs e Universidades.
     3. Jornada e Salário: Aprove se for 40h semanais (qualquer salário) OU se for 20h/30h com salário > R$ 3.000,00.
     4. PND: Marque usa_pnd_como_principal = True se o concurso usar a Prova Nacional Docente (PND / INEP) como nota principal.
@@ -164,22 +165,24 @@ def analisar_vaga_com_ia(client, vaga, data_hoje):
 
 def main():
     data_hoje = datetime.now().strftime("%d/%m/%Y")
-    print(f"Iniciando execução do Radar em {data_hoje}...")
-    if not GEMINI_API_KEY:
-        print("ERRO CRÍTICO: GEMINI_API_KEY está vazia!")
-        return
+    print(f"Iniciando execucao do Radar em {data_hoje}...")
 
-    client = genai.Client(api_key=GEMINI_API_KEY.strip())
     historico = carregar_historico()
+    salvar_historico(historico) # Garante que o arquivo sempre exista
+
     vagas = extrair_vagas()
 
-    if EVENT_NAME == "workflow_dispatch":
-        enviar_telegram(
-            f"🤖 <b>Radar de Concursos Conectado! ({data_hoje})</b>\n"
-            f"🔎 Pré-selecionei <b>{len(vagas)}</b> editais ativos de Professor de História. A filtrar com a IA..."
-        )
+    # Envia o sinal de vida no Telegram ANTES da IA começar!
+    enviar_telegram(
+        f"🤖 <b>Radar de Concursos Ativo! ({data_hoje})</b>\n"
+        f"🔎 Encontrei <b>{len(vagas)}</b> notícias recentes de Professor de História. Filtrando editais abertos agora..."
+    )
 
-    novas_processadas = 0
+    if not GEMINI_API_KEY:
+        print("ERRO: GEMINI_API_KEY nao configurada nos Secrets!")
+        return
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
     aprovadas_hoje = 0
 
     for v in vagas:
@@ -190,14 +193,7 @@ def main():
             print(f"Analisando com IA: {v['titulo']}...")
             resultado = analisar_vaga_com_ia(client, v, data_hoje)
             historico.add(v["url"])
-            novas_processadas += 1
 
-            print(
-                f" -> Aberto={resultado.inscricoes_abertas} | Esfera={resultado.esfera_valida} | "
-                f"Jornada/Salário={resultado.aprovado_regra_jornada_salario} | PND={resultado.usa_pnd_como_principal}"
-            )
-
-            # AGORA EXIGE OS 3: Inscrições Abertas + Esfera Municipal/Estadual + (40h ou > R$3k)
             if resultado.inscricoes_abertas and resultado.esfera_valida and resultado.aprovado_regra_jornada_salario:
                 aprovadas_hoje += 1
                 if resultado.usa_pnd_como_principal:
@@ -218,10 +214,9 @@ def main():
         except Exception as e:
             print(f"Erro ao processar {v['titulo']}: {e}")
 
-    if novas_processadas > 0:
-        salvar_historico(historico)
+    salvar_historico(historico)
 
-    if EVENT_NAME == "workflow_dispatch" and aprovadas_hoje == 0:
+    if aprovadas_hoje == 0:
         enviar_telegram("🏁 Varredura concluída! Nenhuma das vagas novas de hoje passou no filtro estrito (Inscrições Abertas + Estadual/Municipal + 40h ou >R$ 3k).")
 
 if __name__ == "__main__":
