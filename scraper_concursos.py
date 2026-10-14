@@ -7,34 +7,21 @@ from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 from google import genai
-from pydantic import BaseModel, Field
 
-print("=== INICIANDO ROBO DE CONCURSOS V2 ===", flush=True)
+print("=== INICIANDO ROBO DE CONCURSOS V3 ===", flush=True)
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "")
 
-# Mudamos o nome para zerar as 12 vagas que falharam no teste anterior!
-ARQUIVO_HISTORICO = "historico_vagas_v2.json"
+ARQUIVO_HISTORICO = "historico_vagas_v3.json"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
 }
-
-class AnaliseEdital(BaseModel):
-    inscricoes_abertas: bool = Field(description="True se o edital esta aberto ou abre em breve. False APENAS se o prazo ja encerrou claramente ou se for gabarito/suspenso.")
-    esfera_valida: bool = Field(description="True se for Prefeitura Municipal, Camara ou Secretaria Estadual (SEDUC/SED). False se for IF, UF, Universidade ou Militar.")
-    jornada_horas: int = Field(description="Carga horaria semanal para Professor de Historia (ex: 20, 30, 40). Se nao informar no resumo, coloque 0.")
-    salario_bruto: float = Field(description="Maior salario bruto em R$ mencionado para Professor (ou o teto salarial do edital informado no resumo).")
-    aprovado_regra_jornada_salario: bool = Field(description="True se jornada_horas == 40, OU se salario_bruto >= 3000.0, OU se jornada_horas == 0 e salario_bruto >= 3000.0.")
-    usa_pnd_como_principal: bool = Field(description="True SE E SOMENTE SE mencionar Prova Nacional Docente (PND / INEP / CNU Professores) como forma de selecao.")
-    orgao: str = Field(description="Nome da Prefeitura ou Secretaria Estadual e UF (ex: Prefeitura de Panambi - RS)")
-    fim_inscricoes: str = Field(description="Data limite das inscricoes (ex: 28/10/2026) ou 'Consultar edital'")
-    resumo_vaga: str = Field(description="Resumo curto com vagas, salario, carga horaria e banca.")
 
 def carregar_historico():
     if os.path.exists(ARQUIVO_HISTORICO):
@@ -66,7 +53,6 @@ def extrair_vagas():
     vagas = []
     urls_vistas = set()
 
-    # Busca nas páginas diretas de Professor de História e Professor Geral do PCI
     urls_fontes = [
         "https://www.pciconcursos.com.br/cargos/professor-de-historia",
         "https://www.pciconcursos.com.br/pesquisa/professor-de-historia"
@@ -75,7 +61,6 @@ def extrair_vagas():
     for url_fonte in urls_fontes:
         try:
             resp = requests.get(url_fonte, headers=HEADERS, timeout=20)
-            print(f"Fonte {url_fonte} -> Status {resp.status_code}", flush=True)
             soup = BeautifulSoup(resp.text, "html.parser")
 
             for div in soup.select("div.ca, div.na, li"):
@@ -96,40 +81,60 @@ def extrair_vagas():
 
     regex_excluir = r"\b(IF[A-Z]+|UF[A-Z]+|UTFPR|CEFET|UNIVERSIDADE|FACULDADE|GABARITO|RESULTADO|CONVOCA[ÇC][ÃA]O|HOMOLOGA[ÇC][ÃA]O|SUSPENSO|CANCELADO)\b"
     filtradas = [v for v in vagas if not re.search(regex_excluir, v["titulo"].upper())]
-    print(f"Vagas diretas encontradas: {len(filtradas)}", flush=True)
     return filtradas[:15]
 
 def analisar_vaga_com_ia(client, vaga, data_hoje):
-    texto_limpo = f"Resumo do Card: {vaga['resumo_extra']}\n"
+    texto_limpo = f"Resumo da listagem: {vaga['resumo_extra']}\n"
+    link_pdf = ""
+
     try:
         resp = requests.get(vaga["url"], headers=HEADERS, timeout=15)
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
             conteudo = soup.select_one("div#concursos") or soup.select_one("article") or soup.body
             if conteudo:
-                texto_limpo += conteudo.get_text(separator="\n", strip=True)[:14000]
-    except Exception as e:
-        print(f"Erro ao abrir pagina {vaga['url']}: {e}", flush=True)
+                texto_limpo += conteudo.get_text(separator="\n", strip=True)[:12000]
+            # Procura link direto do PDF do Edital na página
+            for a_pdf in soup.find_all("a", href=True):
+                if ".pdf" in a_pdf["href"].lower():
+                    link_pdf = a_pdf["href"]
+                    break
+    except Exception:
+        pass
 
     prompt = f"""
     Data de hoje: {data_hoje}.
-    Analise esta pagina de concurso publico para PROFESSOR DE HISTORIA:
+    Analise esta noticia de concurso publico para PROFESSOR DE HISTORIA:
     Titulo: {vaga['titulo']}
-    Conteudo da pagina:
+    Texto da noticia:
     {texto_limpo}
 
-    Regras de negocio:
-    1. inscricoes_abertas = True se o prazo final de inscricao for maior ou igual a {data_hoje} (ou se abrir em breve).
-    2. esfera_valida = True se for Prefeitura Municipal ou Secretaria Estadual. False se for Universidade ou Instituto Federal.
-    3. aprovado_regra_jornada_salario = True se houver vaga de 40h semanais (qualquer salario), OU se o salario para Professor (ou o teto informado na noticia quando nao detalhado por cargo) for >= R$ 3.000,00.
-    4. usa_pnd_como_principal = True se o edital usar a Prova Nacional Docente (PND / INEP) como etapa principal.
+    Retorne APENAS um objeto JSON valido (sem markdown) com estas exatas chaves:
+    {{
+      "inscricoes_abertas": true ou false (true se as inscricoes ainda estao abertas em {data_hoje} ou abrem em breve; false se ja encerraram),
+      "esfera_valida": true ou false (true se for Prefeitura Municipal, Camara ou Secretaria Estadual; false se for Universidade ou Instituto Federal),
+      "jornada_horas": numero inteiro da carga horaria semanal de Professor de Historia (ex: 20, 30, 40; coloque 0 se nao informado),
+      "salario_bruto": numero decimal do salario para Professor ou teto do edital (ex: 4500.50; coloque 0 se nao informado),
+      "aprovado_regra": true ou false (true se jornada_horas == 40, OU se salario_bruto >= 3000, OU se nao informar salario/horas especificos de Historia mas for edital municipal/estadual aberto),
+      "usa_pnd_principal": true ou false (true se mencionar Prova Nacional Docente / PND / INEP como forma de selecao),
+      "orgao": "Nome da Prefeitura ou Secretaria e UF (ex: Prefeitura de Panambi - RS)",
+      "fim_inscricoes": "Data final de inscricao (ex: 28/10/2026) ou Consultar edital",
+      "resumo": "Resumo curto com vagas, salario, carga horaria e banca organizadora"
+    }}
     """
+
     response = client.models.generate_content(
         model="gemini-2.5-flash",
         contents=prompt,
-        config={"response_mime_type": "application/json", "response_schema": AnaliseEdital, "temperature": 0.1}
+        config={"response_mime_type": "application/json", "temperature": 0.1}
     )
-    return AnaliseEdital.model_validate_json(response.text)
+
+    texto_resp = response.text.strip()
+    # Remove blocos markdown caso o modelo coloque ```json
+    texto_resp = re.sub(r"^```json\s*|\s*```$", "", texto_resp, flags=re.MULTILINE).strip()
+    dados = json.loads(texto_resp)
+    dados["link_pdf"] = link_pdf
+    return dados
 
 def main():
     data_hoje = datetime.now().strftime("%d/%m/%Y")
@@ -139,54 +144,69 @@ def main():
 
     if EVENT_NAME == "workflow_dispatch":
         enviar_telegram(
-            f"🤖 <b>Radar de Concursos V2 Ativo! ({data_hoje})</b>\n"
-            f"🔎 Encontrei <b>{len(vagas)}</b> editais diretos de Professor de História. Analisando um por um..."
+            f"🤖 <b>Radar de Concursos V3 Ativo! ({data_hoje})</b>\n"
+            f"🔎 Encontrei <b>{len(vagas)}</b> editais diretos de Professor de História. Analisando..."
         )
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     aprovadas = 0
     log_descartes = []
+    erros_ia = []
 
     for v in vagas:
         if v["url"] in historico:
             continue
         try:
-            print(f"Analisando: {v['titulo']}", flush=True)
             res = analisar_vaga_com_ia(client, v, data_hoje)
             historico.add(v["url"])
 
-            if res.inscricoes_abertas and res.esfera_valida and res.aprovado_regra_jornada_salario:
+            aberta = bool(res.get("inscricoes_abertas", False))
+            esfera = bool(res.get("esfera_valida", False))
+            aprovado = bool(res.get("aprovado_regra", False))
+            pnd = bool(res.get("usa_pnd_principal", False))
+            horas = int(res.get("jornada_horas", 0) or 0)
+            salario = float(res.get("salario_bruto", 0.0) or 0.0)
+            orgao = res.get("orgao", v["titulo"])
+            fim_insc = res.get("fim_inscricoes", "Consultar")
+            resumo = res.get("resumo", "")
+            link_pdf = res.get("link_pdf", "")
+
+            if aberta and esfera and aprovado:
                 aprovadas += 1
-                cabecalho = "🚨🔥 <b>ALERTA MÁXIMO: EDITAL ABERTO COM PND PRINCIPAL!</b> 🔥🚨" if res.usa_pnd_como_principal else "✅ <b>Concurso Aberto Aprovado (40h / >R$3k)</b>"
-                jornada_str = f"{res.jornada_horas}h" if res.jornada_horas > 0 else "Ver edital"
+                cabecalho = "🚨🔥 <b>ALERTA MÁXIMO: EDITAL ABERTO COM PND PRINCIPAL!</b> 🔥🚨" if pnd else "✅ <b>Concurso Aberto Aprovado (40h / >R$3k)</b>"
+                jornada_str = f"{horas}h" if horas > 0 else "Ver edital"
+                salario_str = f"R$ {salario:.2f}" if salario > 0 else "Ver edital"
+                extra_pdf = f"\n📄 <a href='{link_pdf}'>Baixar PDF do Edital</a>" if link_pdf else ""
+
                 msg = (
                     f"{cabecalho}\n\n"
-                    f"🏛 <b>Órgão:</b> {res.orgao}\n"
-                    f"📅 <b>Inscrições até:</b> {res.fim_inscricoes}\n"
-                    f"⏱ <b>Jornada:</b> {jornada_str} | 💰 <b>Salário:</b> R$ {res.salario_bruto:.2f}\n"
-                    f"📋 <b>Detalhes:</b> {res.resumo_vaga}\n\n"
-                    f"🔗 <a href='{v['url']}'>Acessar notícia / Edital</a>"
+                    f"🏛 <b>Órgão:</b> {orgao}\n"
+                    f"📅 <b>Inscrições até:</b> {fim_insc}\n"
+                    f"⏱ <b>Jornada:</b> {jornada_str} | 💰 <b>Salário:</b> {salario_str}\n"
+                    f"📋 <b>Detalhes:</b> {resumo}\n\n"
+                    f"🔗 <a href='{v['url']}'>Acessar página da vaga</a>{extra_pdf}"
                 )
                 enviar_telegram(msg)
             else:
-                motivo = f"• {res.orgao}: Aberto={res.inscricoes_abertas}, {res.jornada_horas}h, R${res.salario_bruto:.0f}"
-                log_descartes.append(motivo)
+                log_descartes.append(f"• {orgao}: Aberto={aberta}, {horas}h, R${salario:.0f}")
 
-            # Pausa de 5 segundos para respeitar o limite gratuito da API do Gemini!
-            time.sleep(5)
+            time.sleep(4)
 
         except Exception as e:
-            print(f"Erro IA em {v['titulo']}: {e}", flush=True)
-            time.sleep(5)
+            erro_curto = str(e)[:120]
+            print(f"Erro IA em {v['titulo']}: {erro_curto}", flush=True)
+            erros_ia.append(f"• {v['titulo'][:25]}: {erro_curto}")
+            time.sleep(4)
 
     salvar_historico(historico)
 
     if EVENT_NAME == "workflow_dispatch" and aprovadas == 0:
-        resumo_desc = "\n".join(log_descartes[:8]) if log_descartes else "Nenhuma vaga inédita encontrada."
-        enviar_telegram(
-            f"🏁 <b>Varredura concluída!</b> Nenhuma vaga passou no filtro hoje.\n\n"
-            f"📋 <b>Raio-X das vagas avaliadas e descartadas:</b>\n{resumo_desc}"
-        )
+        texto_final = f"🏁 <b>Varredura concluída!</b> Nenhuma vaga passou no filtro hoje.\n\n"
+        if log_descartes:
+            texto_final += "📋 <b>Avaliadas e descartadas:</b>\n" + "\n".join(log_descartes[:8]) + "\n\n"
+        if erros_ia:
+            texto_final += "⚠️ <b>Aviso técnico da API:</b>\n" + "\n".join(erros_ia[:3])
+        enviar_telegram(texto_final)
 
 if __name__ == "__main__":
     main()
