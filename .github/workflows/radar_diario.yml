@@ -1,0 +1,39 @@
+name: Radar Concursos Historia
+
+on:
+  schedule:
+    - cron: '0 11 * * *' # 11:00 UTC = 08:00 Horário de Brasília
+  workflow_dispatch: # Permite rodar manualmente clicando num botão para testar
+
+permissions:
+  contents: write
+
+jobs:
+  varredura:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar código do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar bibliotecas
+        run: pip install requests beautifulsoup4 google-genai pydantic
+
+      - name: Executar Scraper + Filtro IA
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scraper_concursos.py
+
+      - name: Atualizar arquivo de histórico (evitar repetidos)
+        run: |
+          git config --global user.name 'Radar Bot'
+          git config --global user.email 'bot@noreply.github.com'
+          git add historico_vagas.json || true
+          git diff --staged --quiet || git commit -m "Atualiza histórico de vagas lidas"
+          git push
