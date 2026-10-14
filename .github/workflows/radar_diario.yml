@@ -32,10 +32,8 @@ jobs:
 
       - name: Atualizar arquivo de historico
         run: |
-          if [ -f historico_vagas.json ]; then
-            git config --global user.name "Radar Bot"
-            git config --global user.email "bot@noreply.github.com"
-            git add historico_vagas.json
-            git diff --staged --quiet || git commit -m "Atualiza historico de vagas lidas"
-            git push
-          fi
+          touch historico_vagas.json
+          git config --global user.name "Radar Bot"
+          git config --global user.email "bot@noreply.github.com"
+          git add historico_vagas.json
+          git diff --staged --quiet || (git commit -m "Atualiza historico" && git pull --rebase origin main && git push)
