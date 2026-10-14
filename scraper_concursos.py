@@ -3,25 +3,33 @@ import sys
 import time
 import json
 import re
+import urllib.parse
 from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 from google import genai
 
-print("=== INICIANDO ROBO DE CONCURSOS V3 ===", flush=True)
+print("=== INICIANDO ROBO DE CONCURSOS V5 (TOP BANCAS + PND) ===", flush=True)
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "")
 
-ARQUIVO_HISTORICO = "historico_vagas_v3.json"
+ARQUIVO_HISTORICO = "historico_vagas_v5.json"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
 }
+
+# As maiores bancas de concursos municipais/estaduais (Foco Sul + Nacionais)
+BANCAS_ALVO = [
+    "LEGALLE", "FUNDATEC", "OBJETIVA", "FEPESE", "FURB",
+    "FGV", "VUNESP", "CEBRASPE", "IBFC", "AOCP",
+    "CONSULPLAN", "LA SALLE", "UNIOESTE", "FAFIPA", "INEP", "PND"
+]
 
 def carregar_historico():
     if os.path.exists(ARQUIVO_HISTORICO):
@@ -53,9 +61,20 @@ def extrair_vagas():
     vagas = []
     urls_vistas = set()
 
+    # 1. Páginas principais de Professor de História + Pesquisas focadas nas Top Bancas
     urls_fontes = [
         "https://www.pciconcursos.com.br/cargos/professor-de-historia",
-        "https://www.pciconcursos.com.br/pesquisa/professor-de-historia"
+        "https://www.pciconcursos.com.br/pesquisa/professor-de-historia",
+        "https://www.pciconcursos.com.br/pesquisa/professor+legalle",
+        "https://www.pciconcursos.com.br/pesquisa/professor+fundatec",
+        "https://www.pciconcursos.com.br/pesquisa/professor+objetiva",
+        "https://www.pciconcursos.com.br/pesquisa/professor+fepese",
+        "https://www.pciconcursos.com.br/pesquisa/professor+fgv",
+        "https://www.pciconcursos.com.br/pesquisa/professor+vunesp",
+        "https://www.pciconcursos.com.br/pesquisa/professor+ibfc",
+        "https://www.pciconcursos.com.br/pesquisa/professor+aocp",
+        "https://www.pciconcursos.com.br/pesquisa/professor+cebraspe",
+        "https://www.pciconcursos.com.br/pesquisa/professor+pnd"
     ]
 
     for url_fonte in urls_fontes:
@@ -79,9 +98,57 @@ def extrair_vagas():
         except Exception as e:
             print(f"Erro ao ler {url_fonte}: {e}", flush=True)
 
-    regex_excluir = r"\b(IF[A-Z]+|UF[A-Z]+|UTFPR|CEFET|UNIVERSIDADE|FACULDADE|GABARITO|RESULTADO|CONVOCA[ÇC][ÃA]O|HOMOLOGA[ÇC][ÃA]O|SUSPENSO|CANCELADO)\b"
+    # 2. Busca Complementar via Google News RSS focado nas 10 Maiores Bancas + PND
+    try:
+        bancas_query = '("Legalle" OR "Fundatec" OR "Objetiva" OR "FEPESE" OR "FGV" OR "Vunesp" OR "IBFC" OR "AOCP" OR "Cebraspe" OR "Consulplan" OR "PND")'
+        query = urllib.parse.quote(f'("Professor de História" OR "Professor") (edital OR inscrições) {bancas_query}')
+        rss_url = f"https://news.google.com/rss/search?q={query}+when:7d&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+        resp_rss = requests.get(rss_url, headers=HEADERS, timeout=20)
+        soup_rss = BeautifulSoup(resp_rss.text, "html.parser")
+        for item in soup_rss.find_all("item")[:10]:
+            titulo = item.title.get_text(strip=True) if item.title else ""
+            descricao = item.description.get_text(strip=True) if item.description else ""
+            link = ""
+            if item.link:
+                link = item.link.get_text(strip=True) or (item.link.next_sibling.strip() if item.link.next_sibling else "")
+            if link and link not in urls_vistas:
+                urls_vistas.add(link)
+                vagas.append({"titulo": titulo, "url": link, "resumo_extra": descricao})
+    except Exception as e:
+        print(f"Aviso RSS Bancas: {e}", flush=True)
+
+    regex_excluir = r"\b(IF[A-Z]+|UF[A-Z]+|UTFPR|CEFET|UNIVERSIDADE|FACULDADE|MARINHA|EX[EÉ]RCITO|AERON[AÁ]UTICA|GABARITO|RESULTADO|CONVOCA[ÇC][ÃA]O|HOMOLOGA[ÇC][ÃA]O|SUSPENSO|CANCELADO)\b"
     filtradas = [v for v in vagas if not re.search(regex_excluir, v["titulo"].upper())]
+
+    # Sistema de Prioridade: coloca no topo da fila vagas das 10 Bancas, PND ou de RS/SC/PR!
+    def calcular_prioridade(vaga):
+        texto_busca = (vaga["titulo"] + " " + vaga["resumo_extra"] + " " + vaga["url"]).upper()
+        pontos = 0
+        if any(b in texto_busca for b in BANCAS_ALVO):
+            pontos += 10
+        if re.search(r"\b(RS|SC|PR)\b", texto_busca):
+            pontos += 5
+        return pontos
+
+    filtradas.sort(key=calcular_prioridade, reverse=True)
     return filtradas[:15]
+
+def chamar_gemini_com_fallback(client, prompt):
+    modelos = ["gemini-flash-latest", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.0-flash"]
+    ultimo_erro = None
+    for mod in modelos:
+        try:
+            return client.models.generate_content(
+                model=mod,
+                contents=prompt,
+                config={"response_mime_type": "application/json", "temperature": 0.1}
+            )
+        except Exception as e:
+            ultimo_erro = e
+            if "404" in str(e) or "NOT_FOUND" in str(e) or "no longer available" in str(e):
+                continue
+            raise e
+    raise ultimo_erro
 
 def analisar_vaga_com_ia(client, vaga, data_hoje):
     texto_limpo = f"Resumo da listagem: {vaga['resumo_extra']}\n"
@@ -93,8 +160,7 @@ def analisar_vaga_com_ia(client, vaga, data_hoje):
             soup = BeautifulSoup(resp.text, "html.parser")
             conteudo = soup.select_one("div#concursos") or soup.select_one("article") or soup.body
             if conteudo:
-                texto_limpo += conteudo.get_text(separator="\n", strip=True)[:12000]
-            # Procura link direto do PDF do Edital na página
+                texto_limpo += conteudo.get_text(separator="\n", strip=True)[:13000]
             for a_pdf in soup.find_all("a", href=True):
                 if ".pdf" in a_pdf["href"].lower():
                     link_pdf = a_pdf["href"]
@@ -104,33 +170,30 @@ def analisar_vaga_com_ia(client, vaga, data_hoje):
 
     prompt = f"""
     Data de hoje: {data_hoje}.
-    Analise esta noticia de concurso publico para PROFESSOR DE HISTORIA:
+    Analise esta noticia de concurso publico verificando se contempla PROFESSOR DE HISTORIA (ou Professor de Educacao Basica / Anos Finais):
     Titulo: {vaga['titulo']}
     Texto da noticia:
     {texto_limpo}
 
+    Bancas prioritarias de referencia: Legalle Concursos, Fundatec, Objetiva Concursos, FEPESE, FURB, FGV, Vunesp, Cebraspe, IBFC, Instituto AOCP, Consulplan.
+
     Retorne APENAS um objeto JSON valido (sem markdown) com estas exatas chaves:
     {{
-      "inscricoes_abertas": true ou false (true se as inscricoes ainda estao abertas em {data_hoje} ou abrem em breve; false se ja encerraram),
-      "esfera_valida": true ou false (true se for Prefeitura Municipal, Camara ou Secretaria Estadual; false se for Universidade ou Instituto Federal),
-      "jornada_horas": numero inteiro da carga horaria semanal de Professor de Historia (ex: 20, 30, 40; coloque 0 se nao informado),
+      "inscricoes_abertas": true ou false (true se as inscricoes ainda estao abertas em {data_hoje} ou abrem em breve; false se ja encerraram claramente ou se nao houver vaga para Professor/Historia),
+      "esfera_valida": true ou false (true se for Prefeitura Municipal, Camara ou Secretaria Estadual; false se for Universidade, Instituto Federal ou Militar),
+      "jornada_horas": numero inteiro da carga horaria semanal de Professor (ex: 20, 30, 40; coloque 0 se nao informado),
       "salario_bruto": numero decimal do salario para Professor ou teto do edital (ex: 4500.50; coloque 0 se nao informado),
-      "aprovado_regra": true ou false (true se jornada_horas == 40, OU se salario_bruto >= 3000, OU se nao informar salario/horas especificos de Historia mas for edital municipal/estadual aberto),
+      "aprovado_regra": true ou false (true se jornada_horas == 40, OU se salario_bruto >= 3000, OU se nao informar salario/horas especificos de Historia mas for edital municipal/estadual aberto para Professor),
       "usa_pnd_principal": true ou false (true se mencionar Prova Nacional Docente / PND / INEP como forma de selecao),
+      "banca": "Nome da banca organizadora (ex: Legalle Concursos, Fundatec, FGV, ou 'Nao informada')",
       "orgao": "Nome da Prefeitura ou Secretaria e UF (ex: Prefeitura de Panambi - RS)",
       "fim_inscricoes": "Data final de inscricao (ex: 28/10/2026) ou Consultar edital",
-      "resumo": "Resumo curto com vagas, salario, carga horaria e banca organizadora"
+      "resumo": "Resumo curto com vagas, salario, carga horaria e detalhes para Professor"
     }}
     """
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config={"response_mime_type": "application/json", "temperature": 0.1}
-    )
-
+    response = chamar_gemini_com_fallback(client, prompt)
     texto_resp = response.text.strip()
-    # Remove blocos markdown caso o modelo coloque ```json
     texto_resp = re.sub(r"^```json\s*|\s*```$", "", texto_resp, flags=re.MULTILINE).strip()
     dados = json.loads(texto_resp)
     dados["link_pdf"] = link_pdf
@@ -144,8 +207,8 @@ def main():
 
     if EVENT_NAME == "workflow_dispatch":
         enviar_telegram(
-            f"🤖 <b>Radar de Concursos V3 Ativo! ({data_hoje})</b>\n"
-            f"🔎 Encontrei <b>{len(vagas)}</b> editais diretos de Professor de História. Analisando..."
+            f"🤖 <b>Radar de Concursos V5 Ativo! ({data_hoje})</b>\n"
+            f"🔎 Encontrei <b>{len(vagas)}</b> editais priorizando Top Bancas (Legalle, Fundatec, Objetiva, FGV...) + PND. Analisando..."
         )
 
     client = genai.Client(api_key=GEMINI_API_KEY)
@@ -166,6 +229,7 @@ def main():
             pnd = bool(res.get("usa_pnd_principal", False))
             horas = int(res.get("jornada_horas", 0) or 0)
             salario = float(res.get("salario_bruto", 0.0) or 0.0)
+            banca = res.get("banca", "Consultar edital")
             orgao = res.get("orgao", v["titulo"])
             fim_insc = res.get("fim_inscricoes", "Consultar")
             resumo = res.get("resumo", "")
@@ -181,6 +245,7 @@ def main():
                 msg = (
                     f"{cabecalho}\n\n"
                     f"🏛 <b>Órgão:</b> {orgao}\n"
+                    f"🎯 <b>Banca:</b> {banca}\n"
                     f"📅 <b>Inscrições até:</b> {fim_insc}\n"
                     f"⏱ <b>Jornada:</b> {jornada_str} | 💰 <b>Salário:</b> {salario_str}\n"
                     f"📋 <b>Detalhes:</b> {resumo}\n\n"
@@ -188,7 +253,7 @@ def main():
                 )
                 enviar_telegram(msg)
             else:
-                log_descartes.append(f"• {orgao}: Aberto={aberta}, {horas}h, R${salario:.0f}")
+                log_descartes.append(f"• {orgao} ({banca}): Aberto={aberta}, {horas}h, R${salario:.0f}")
 
             time.sleep(4)
 
